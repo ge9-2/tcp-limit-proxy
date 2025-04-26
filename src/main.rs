@@ -38,6 +38,18 @@ async fn main() -> Result<(), BoxedError> {
         "The local port to which tcpproxy should bind to, randomly chosen otherwise",
         "LOCAL_PORT",
     );
+    opts.optopt(
+        "t",
+        "timeout",
+        "How long each connection is alive before graceful shutdown, defaulting to 0 (no timeout)",
+        "TIMEOUT_MS",
+    );
+    opts.optopt(
+        "m",
+        "max_kb",
+        "The total amount of data (in kB) that each connection can pass, defaulting to 0 (no limit)",
+        "MAX_KB",
+    );
     opts.optflag("d", "debug", "Enable debug mode");
 
     let matches = match opts.parse(&args[1..]) {
@@ -68,11 +80,13 @@ async fn main() -> Result<(), BoxedError> {
         Some(addr) => addr,
         None => "127.0.0.1".to_owned(),
     };
+    let timeout_ms: u64 = matches.opt_str("t").map(|s| s.parse()).unwrap_or(Ok(0))?;
+    let max_kb: usize = matches.opt_str("m").map(|s| s.parse()).unwrap_or(Ok(0))?;
 
-    forward(&bind_addr, local_port, remote).await
+    forward(&bind_addr, local_port, timeout_ms, max_kb, remote).await
 }
 
-async fn forward(bind_ip: &str, local_port: i32, remote: String) -> Result<(), BoxedError> {
+async fn forward(bind_ip: &str, local_port: i32, timeout_ms: u64, max_kb: usize, remote: String) -> Result<(), BoxedError> {
     // Listen on the specified IP and port
     let bind_addr = if !bind_ip.starts_with('[') && bind_ip.contains(':') {
         // Correctly format for IPv6 usage
@@ -103,6 +117,7 @@ async fn forward(bind_ip: &str, local_port: i32, remote: String) -> Result<(), B
         read: &mut R,
         write: &mut W,
         mut abort: broadcast::Receiver<()>,
+        max_kb: usize
     ) -> tokio::io::Result<usize>
     where
         R: tokio::io::AsyncRead + Unpin,
@@ -136,6 +151,9 @@ async fn forward(bind_ip: &str, local_port: i32, remote: String) -> Result<(), B
             // the other side is always treated as exceptional.
             write.write_all(&buf[0..bytes_read]).await?;
             copied += bytes_read;
+            if max_kb > 0 && copied >= 10 * max_kb {
+                break;
+            }
         }
 
         Ok(copied)
@@ -147,6 +165,14 @@ async fn forward(bind_ip: &str, local_port: i32, remote: String) -> Result<(), B
         tokio::spawn(async move {
             println!("New connection from {}", client_addr);
 
+            let (cancel, _) = broadcast::channel::<()>(1);
+            if timeout_ms > 0{
+                let cancel_clone = cancel.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)).await;
+                    let _ = cancel_clone.send(());
+                });
+            }
             // Establish connection to upstream for each incoming client connection
             let mut remote = match TcpStream::connect(remote).await {
                 Ok(result) => result,
@@ -158,11 +184,10 @@ async fn forward(bind_ip: &str, local_port: i32, remote: String) -> Result<(), B
             let (mut client_read, mut client_write) = client.split();
             let (mut remote_read, mut remote_write) = remote.split();
 
-            let (cancel, _) = broadcast::channel::<()>(1);
             let (remote_copied, client_copied) = tokio::join! {
-                copy_with_abort(&mut remote_read, &mut client_write, cancel.subscribe())
+                copy_with_abort(&mut remote_read, &mut client_write, cancel.subscribe(), max_kb)
                     .then(|r| { let _ = cancel.send(()); async { r } }),
-                copy_with_abort(&mut client_read, &mut remote_write, cancel.subscribe())
+                copy_with_abort(&mut client_read, &mut remote_write, cancel.subscribe(), max_kb)
                     .then(|r| { let _ = cancel.send(()); async { r } }),
             };
 
